@@ -1,0 +1,387 @@
+---
+title: "Ex 1"
+author: "Heidi Al Wakeel"
+date: "2023-03-14"
+output: html_document
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Libraries
+library(tidyverse)
+library(igraph)
+library(janitor)
+library(stringi)
+```
+
+# Check the data
+
+```{r}
+df <-  read.csv("C:/Users/Heidi Al Wakeel/Downloads/Basic_LinkedInDataExport_03-09-2023/Connections.csv")
+df <- df %>% 
+  select(-c("Email.Address"))
+```
+
+# Standardize the name of the companies
+
+There are still some duplicates with inc. or canada. A more systematic way by using the companies name resemblance could be used but that's not the goal of this project and most of the duplicates were fixed by doing these simple fix.
+
+```{r}
+# Lower case company name
+df <- 
+  df %>% 
+  mutate(company = tolower(Company))  # lower case
+# If no company, write "unknown"
+df <- 
+  df %>% 
+  mutate(Company = replace_na(Company, "None")) %>% 
+  mutate(Company = replace(Company, Company=="", "unknown"))
+# Remove accents in the column
+df$Company <- stri_trans_general(str=df$Company, id="Latin-ASCII")
+# Replace everything starting with McGill by just McGill
+df <- df %>% 
+  mutate(company = replace(Company, str_detect(Company, "mcgill"), "mcgill"))
+# Remove "-" and replace with space
+df <- df %>% 
+  mutate(Company = str_replace(Company, "-", " "))
+# PRIVACY
+#df %>% head(10)
+```
+
+# Get the count of contacts by company
+
+```{r}
+count <- df %>% 
+  group_by(Company) %>% 
+  count() %>% 
+  arrange(desc(n))
+  
+count %>% arrange(desc(n)) %>% head(10) %>% 
+  ggplot(aes(y = reorder(Company,n), x=n))+
+  geom_col(fill="steelblue") +
+  labs(
+    x = "Number of contacts",
+    y = "Companies",
+    title = "Top 10 companies of my connections"
+  )
+```
+
+
+
+```{r}
+count
+```
+
+# Get the total count
+
+```{r}
+total_count = sum(count$n)
+print(c("Total connections = ", total_count))
+```
+
+# Create the graph
+
+## Create a column with the first and last name
+
+```{r}
+df <- df %>% 
+  unite(name, c("First.Name", "Last.Name"))
+```
+
+## Remove the unknown company contacts from the network
+```{r}
+df <- df %>% filter(Company!="unknown")
+```
+
+
+## Create the nodes
+```{r}
+nodes <- df %>% select(c("name", "Company"))
+nodes <- nodes %>% rowid_to_column("id")
+```
+
+## Create the edges
+Left join the id of the contact's name with the same company name
+
+```{r}
+edges <- df %>% select(c(name, Company)) %>% 
+  left_join(nodes %>% select(c(id,name)), by = c("name"="name"))
+edges <- edges %>% left_join(edges, by = "Company", keep=FALSE) %>% 
+  select(c("id.x", "id.y", "Company")) %>% 
+  filter(id.x!=id.y) # remove the connections between itself
+colnames(edges) <- c("x", "y", "Company")
+edges %>% head(10)
+```
+
+## Create the graph
+```{r}
+library(tidygraph)
+library(ggraph)
+graph <- tbl_graph(edges = edges, nodes=nodes, directed = FALSE)
+```
+
+
+## Plot the resulting full graph
+```{r}
+ggraph(graph, layout = "graphopt") + 
+  geom_edge_link(aes(color = Company), show.legend = FALSE) + 
+  geom_node_point()+
+  theme_graph()
+```
+
+
+
+## Now, I wanted to take a deeper dive:
+
+```{r }
+connections <- read.csv("C:/Users/Heidi Al Wakeel/Downloads/Basic_LinkedInDataExport_03-09-2023/Connections.csv")
+
+
+connections <- na.omit(connections)
+
+
+attach(connections)
+
+
+# Create a table with 
+connections$name =  paste(connections$First.Name, substr(connections$Last.Name, start = 1, stop = 1), sep = " ")
+
+connections = connections[, c("name", "Company","Position", "Connected.On")]
+
+# create a frequency table
+freq_table = table(connections$Company)
+freq_table = sort(freq_table, decreasing = TRUE)
+first10= head(freq_table, n = 10)
+
+
+# Display the list as a table
+knitr::kable(first10, col.names = c("Company", "Connections"))
+```
+
+
+### Top 10 Companies and their frequencies
+```{r }
+
+# create a bar chart of the frequency table
+barplot(first10, main = "Top 10 Companies", 
+         ylab = "Number of Connections",
+        col = "Pink", las = 2, cex.names = 0.8)
+
+```
+
+### Creating nodes
+
+```{r }
+
+library(tidyverse)
+
+people <- connections %>%
+  distinct(name) %>%
+  rename(label = name)
+
+companies <- connections %>%
+  distinct(Company) %>%
+  rename(label = Company)
+
+nodes <- full_join(people, companies, by = "label")
+nodes <- rowid_to_column(nodes, "id")
+head(nodes)
+```
+
+
+### Creating edges
+```{r }
+
+#### Creating edges
+
+edges <- connections[, c("name", "Company")]
+
+edges <- edges %>% 
+  left_join(nodes, by = c("name" = "label")) %>% 
+  rename(from = id)
+
+edges <- edges %>% 
+  left_join(nodes, by = c("Company" = "label")) %>% 
+  rename(to = id)
+
+edges <- unique(select(edges, from, to))
+head(edges)
+```
+
+
+### Graph using the network library
+
+```{r }
+
+## Building network
+library(network)
+
+routes_network <- network(edges,
+                          vertex.attr = nodes,
+                          matrix.type = "edgelist",
+                          ignore.eval = FALSE)
+plot(routes_network, vertex.cex = 1,vertex.col="green")
+```
+
+
+### Graph using igraph
+
+```{r }
+
+## igraph
+
+library(igraph)
+routes <- graph_from_data_frame(d = edges,
+                                       vertices = nodes,
+                                       directed = TRUE)
+
+plot(routes,
+     vertex.size = 3,
+     vertex.label.cex = 0.2,
+     edge.arrow.size = 0.01, vertex.col="green")
+```
+
+
+
+
+
+
+```{r }
+library(dplyr)
+
+connections_filtered <- connections %>%
+  group_by(Company) %>%
+  filter(n() > 1) %>%
+  ungroup()
+
+```
+
+
+### Recreating nodes for companies with more than 1 connection
+
+```{r }
+
+people <- connections_filtered %>%
+  distinct(name) %>%
+  rename(label = name)
+
+companies <- connections_filtered %>%
+  distinct(Company) %>%
+  rename(label = Company)
+
+nodes <- full_join(people, companies, by = "label")
+nodes <- rowid_to_column(nodes, "id")
+```
+
+
+
+### Recreating edges
+
+```{r}
+#### Creating edges
+
+edges <- connections_filtered[, c("name", "Company")]
+
+edges <- edges %>% 
+  left_join(nodes, by = c("name" = "label")) %>% 
+  rename(from = id)
+
+edges <- edges %>% 
+  left_join(nodes, by = c("Company" = "label")) %>% 
+  rename(to = id)
+
+edges <- unique(select(edges, from, to))
+```
+
+## Graph using the network library
+
+
+```{r}
+## Building network
+library(network)
+
+routes_network <- network(edges,
+                          vertex.attr = nodes,
+                          matrix.type = "edgelist",
+                          ignore.eval = FALSE)
+plot(routes_network, vertex.cex = 1, vertex.col="green")
+```
+
+
+### Graph using igraph
+
+```{r}
+
+## igraph
+
+library(igraph)
+routes <- graph_from_data_frame(d = edges,
+                                       vertices = nodes,
+                                       directed = TRUE)
+
+plot(routes,
+     vertex.size = 1,
+     vertex.label.cex = 0.25,
+     edge.arrow.size = 0.05
+     )
+```
+
+
+
+
+
+
+
+
+
+
+
+## Final graph with no companies
+
+
+```{r }
+# Filter connections to only include companies with 2 or more employees
+
+contact_count <- connections %>% 
+  group_by(Company) %>% 
+  summarize(count = n())
+
+Connections <- connections %>%
+  inner_join(contact_count, by = "Company") %>%
+  filter(count >= 2) %>%
+  select(name, Company)
+
+# Create nodes dataframe using tidygraph
+nodes <- Connections %>%
+  mutate(label = name) %>%
+  distinct(label) %>%
+  as_tibble() %>%
+  select(label)
+
+# Create edges dataframe using tidygraph
+edges <- Connections %>%
+  left_join(connections, by = "Company") %>%
+  filter(name.x != name.y) %>%
+  mutate(from = name.x,
+         to = name.y) %>%
+  select(from, to)
+
+# Create graph using igraph
+graph <- graph_from_data_frame(edges, vertices = nodes, directed = FALSE)
+
+
+```
+
+
+
+
+
+
+```{r }
+par(mar = rep(1, 4))
+options(repr.plot.width = 10, repr.plot.height = 10)
+plot(graph, vertex.size = 7, vertex.color = "green", vertex.label.cex = 0.6, edge.color = "gray", edge.width = 2, edge.length=30, vertex.dist = 50)
+```
+
