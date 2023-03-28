@@ -1,0 +1,517 @@
+---
+title: "Exercise 3"
+author: "Heidi Al Wakeel"
+date: "2023-03-24"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(lubridate)
+library(arrow)
+library(readr)
+library(gender)
+library(wru)
+library(lubridate)
+library(ggplot2)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+```
+
+```{r}
+data_path <- "C:/Users/Heidi Al Wakeel/Documents/2023-ona-assignments/"
+applications <- read_parquet(paste0(data_path,"app_data_sample.parquet"))
+edges <- read_csv(paste0(data_path,"edges_sample.csv"))
+
+```
+```{r}
+applications
+
+```
+
+
+```{r}
+edges
+```
+
+
+## Question 1
+
+### Get gender for examiners
+
+We'll get gender based on the first name of the examiner, which is recorded in the field `examiner_name_first`. We'll use library `gender` for that, relying on a modified version of their own [example](https://cran.r-project.org/web/packages/gender/vignettes/predicting-gender.html).
+
+Note that there are over 2 million records in the applications table -- that's because there are many records for each examiner, as many as the number of applications that examiner worked on during this time frame. Our first step therefore is to get all *unique* names in a separate list `examiner_names`. We will then guess gender for each one and will join this table back to the original dataset. So, let's get names without repetition:
+
+
+```{r}
+#install_genderdata_package() # only run this line the first time you use the package, to get data for it
+# get a list of first names without repetitions
+examiner_names <- applications %>% 
+  distinct(examiner_name_first)
+examiner_names
+```
+
+Now let's use function `gender()` as shown in the example for the package to attach a gender and probability to each name and put the results into the table `examiner_names_gender`
+
+```{r}
+# get a table of names and gender
+examiner_names_gender <- examiner_names %>% 
+  do(results = gender(.$examiner_name_first, method = "ssa")) %>% 
+  unnest(cols = c(results), keep_empty = TRUE) %>% 
+  select(
+    examiner_name_first = name,
+    gender,
+    proportion_female
+  )
+examiner_names_gender
+```
+
+Finally, let's join that table back to our original applications data and discard the temporary tables we have just created to reduce clutter in our environment.
+
+```{r}
+# remove extra colums from the gender table
+examiner_names_gender <- examiner_names_gender %>% 
+  select(examiner_name_first, gender)
+# joining gender back to the dataset
+applications <- applications %>% 
+  left_join(examiner_names_gender, by = "examiner_name_first")
+# cleaning up
+rm(examiner_names)
+rm(examiner_names_gender)
+gc()
+```
+
+
+### Guess the examiner's race
+
+We'll now use package `wru` to estimate likely race of an examiner. Just like with gender, we'll get a list of unique names first, only now we are using surnames.
+
+
+```{r}
+examiner_surnames <- applications %>% 
+  select(surname = examiner_name_last) %>% 
+  distinct()
+examiner_surnames
+```
+We'll follow the instructions for the package outlined here [https://github.com/kosukeimai/wru](https://github.com/kosukeimai/wru).
+
+```{r}
+examiner_race <- predict_race(voter.file = examiner_surnames, surname.only = T) %>% 
+  as_tibble()
+examiner_race
+```
+
+As you can see, we get probabilities across five broad US Census categories: white, black, Hispanic, Asian and other. (Some of you may correctly point out that Hispanic is not a race category in the US Census, but these are the limitations of this package.)
+
+Our final step here is to pick the race category that has the highest probability for each last name and then join the table back to the main applications table. See this example for comparing values across columns: [https://www.tidyverse.org/blog/2020/04/dplyr-1-0-0-rowwise/](https://www.tidyverse.org/blog/2020/04/dplyr-1-0-0-rowwise/). And this one for `case_when()` function: [https://dplyr.tidyverse.org/reference/case_when.html](https://dplyr.tidyverse.org/reference/case_when.html).
+
+```{r}
+examiner_race <- examiner_race %>% 
+  mutate(max_race_p = pmax(pred.asi, pred.bla, pred.his, pred.oth, pred.whi)) %>% 
+  mutate(race = case_when(
+    max_race_p == pred.asi ~ "Asian",
+    max_race_p == pred.bla ~ "black",
+    max_race_p == pred.his ~ "Hispanic",
+    max_race_p == pred.oth ~ "other",
+    max_race_p == pred.whi ~ "white",
+    TRUE ~ NA_character_
+  ))
+examiner_race
+```
+
+Let's join the data back to the applications table.
+
+```{r}
+# removing extra columns
+examiner_race <- examiner_race %>% 
+  select(surname,race)
+applications <- applications %>% 
+  left_join(examiner_race, by = c("examiner_name_last" = "surname"))
+rm(examiner_race)
+rm(examiner_surnames)
+gc()
+```
+
+
+## Examiner's tenure 
+
+To figure out the timespan for which we observe each examiner in the applications data, let's find the first and the last observed date for each examiner. We'll first get examiner IDs and application dates in a separate table, for ease of manipulation. We'll keep examiner ID (the field `examiner_id`), and earliest and latest dates for each application (`filing_date` and `appl_status_date` respectively). We'll use functions in package `lubridate` to work with date and time values.
+
+```{r}
+examiner_dates <- applications %>% 
+  select(examiner_id, filing_date, appl_status_date) 
+examiner_dates
+```
+
+The dates look inconsistent in terms of formatting. Let's make them consistent. We'll create new variables `start_date` and `end_date`.
+
+```{r}
+examiner_dates <- examiner_dates %>% 
+  mutate(start_date = ymd(filing_date), end_date = as_date(dmy_hms(appl_status_date)))
+```
+
+Let's now identify the earliest and the latest date for each examiner and calculate the difference in days, which is their tenure in the organization.
+
+```{r}
+examiner_dates <- examiner_dates %>% 
+  group_by(examiner_id) %>% 
+  summarise(
+    earliest_date = min(start_date, na.rm = TRUE), 
+    latest_date = max(end_date, na.rm = TRUE),
+    tenure_days = interval(earliest_date, latest_date) %/% days(1)
+    ) %>% 
+  filter(year(latest_date)<2018)
+examiner_dates
+```
+
+Joining back to the applications data.
+
+```{r}
+applications <- applications %>% 
+  left_join(examiner_dates, by = "examiner_id")
+rm(examiner_dates)
+gc()
+```
+
+
+
+## Question2
+
+
+```{r}
+# we pick work group 179 and 176
+w179 <- subset(applications, grepl("^179", applications$examiner_art_unit))
+w179$gender <- factor(w179$gender)
+w179$race <- factor(w179$race)
+w176 <- subset(applications, grepl("^176", applications$examiner_art_unit))
+w176$gender <- factor(w176$gender)
+w176$race <- factor(w176$race)
+
+
+```
+
+
+
+
+```{r}
+
+# Summary statistics for work group 179
+summary(w179$gender)
+summary(w179$race)
+summary(w179$tenure_days)
+
+# Summary statistics for work group 176
+
+summary(w176$gender)
+summary(w176$race)
+summary(w176$tenure_days)
+
+```
+
+
+
+
+
+
+
+Race and gender distribution for work group 179 and 176 respectively
+```{r}
+# merge 
+w179$workgroup <- c('179')
+w176$workgroup <- c('176')
+merged = union(x = w179,y = w176)
+```
+
+Gender distribution in races for work group 179
+```{r}
+toPlot<-w179%>%
+  group_by(gender, race)%>%
+  summarise(n = n())%>%
+  group_by(race)%>%
+  mutate(prop = n/sum(n))
+ggplot(data = toPlot, aes(gender, prop, fill = race)) + 
+  geom_col() + 
+  facet_grid(~race)+
+  scale_fill_manual(values = c("lightyellow3","lightsalmon3", "wheat3","white", "lightpink"))
+```
+
+Gender distribution in races for work group 176
+```{r}
+
+toPlot<-w176%>%
+  group_by(gender, race)%>%
+  summarise(n = n())%>%
+  group_by(race)%>%
+  mutate(prop = n/sum(n))
+ggplot(data = toPlot, aes(gender, prop, fill = race)) + 
+  geom_col() + 
+  facet_grid(~race)+
+  scale_fill_manual(values = c("lightyellow3","lightsalmon3", "wheat3","white","lightpink"))
+
+```
+
+#Let's take a deeper dive:
+
+```{r plots1}
+# Choosing workgroups 176 and 179
+wg1 = applications %>% filter(substr(examiner_art_unit, 1, 3) == '176' ) %>% 
+  arrange(application_number)
+wg2 = applications %>% filter(substr(examiner_art_unit, 1, 3) == '179' ) %>% 
+  arrange(application_number)
+#summary(wg1)
+# distributions for wg 176
+p1 = wg1 %>% group_by(race) %>% summarise(n_examiners = n_distinct(examiner_id)) %>% 
+  ggplot(aes(x = race, y = n_examiners)) + geom_bar(stat ='identity')
+p2 = wg1 %>% group_by(gender) %>% summarise(n_examiners = n_distinct(examiner_id)) %>% 
+  ggplot(aes(x = gender, y = n_examiners)) + geom_bar(stat ='identity')
+p3 = wg1 %>% ggplot(aes(x = tenure_days)) + geom_histogram()
+
+print(p1)
+print(p2)
+print(p3)
+```
+
+```{r}
+# distributions for wg 179
+p1 = wg2 %>% group_by(race) %>% summarise(n_examiners = n_distinct(examiner_id)) %>% 
+  ggplot(aes(x = race, y = n_examiners)) + geom_bar(stat ='identity')
+p2 = wg2 %>% group_by(gender) %>% summarise(n_examiners = n_distinct(examiner_id)) %>% 
+  ggplot(aes(x = gender, y = n_examiners)) + geom_bar(stat ='identity')
+p3 = wg2 %>% ggplot(aes(x = tenure_days)) + geom_histogram()
+#par(mfrow=c(1,3))
+#grid.arrange(p1, p2, p3, ncol=3)
+p1
+p2
+p3
+```
+
+
+
+
+
+
+## Question 3
+
+Create node lists for eacch work group
+```{r}
+# join selected work groups with edges list
+edges <- drop_na(edges, ego_examiner_id)
+edges <-drop_na(edges, alter_examiner_id)
+w179_2 <- inner_join(w179, edges, by = "application_number", copy = FALSE) 
+w176_2 <- inner_join(w176, edges, by = "application_number", copy = FALSE) 
+# nodes dataframe of work groups and merge them
+w179_nodes1 <- w179_2 %>% 
+  distinct(ego_examiner_id) %>%
+  rename(ID = ego_examiner_id)
+w179_nodes2 <- w179_2 %>% 
+  distinct(alter_examiner_id) %>%
+  rename(ID = alter_examiner_id)
+w176_nodes1 <- w176_2 %>% 
+  distinct(ego_examiner_id) %>%
+  rename(ID = ego_examiner_id)
+w176_nodes2 <- w176_2 %>% 
+  distinct(alter_examiner_id) %>%
+  rename(ID = alter_examiner_id)
+# merge the two dataframes for each work goup
+w179_nodes <- union_all(w179_nodes1, w179_nodes2)
+w176_nodes <- union_all(w176_nodes1, w176_nodes2)
+w179_nodes <- unique(w179_nodes)
+w176_nodes <- unique(w176_nodes)
+head(w179_nodes, 5)
+```
+
+Create final edge list
+```{r}
+w179_edges <- w179_2 %>% 
+  select(ego_examiner_id, alter_examiner_id)
+w176_edges <- w176_2 %>% 
+  select(ego_examiner_id, alter_examiner_id)
+head(w179_edges, 5)
+```
+
+
+```{r}
+g_w179 <- graph_from_data_frame(w179_edges, directed=FALSE)
+g_w176 <- graph_from_data_frame(w176_edges, directed=FALSE)
+```
+
+Plot vertex graph for work group 179
+```{r}
+plot(g_w179, layout=layout.fruchterman.reingold,
+    vertex.size = 5,
+    vertex.label = NA,
+    vertex.color = "palevioletred2")
+```
+
+Plot vertex graph for work group 176
+```{r}
+plot(g_w176, layout=layout.fruchterman.reingold,
+    vertex.size = 5,
+    vertex.label = NA,
+    vertex.color = "darkslategray3")
+```
+```{r}
+
+applications <- applications %>% 
+  mutate(examiner_workgroup = str_sub(examiner_art_unit, 1, -2))
+
+applications <- applications %>% drop_na(gender, tenure_days, race)
+
+examiner_data <- applications %>%
+  distinct(examiner_id, examiner_gender = gender, 
+           examiner_race = race, examiner_tenure = tenure_days) 
+
+examiner_subset <- applications %>% 
+  filter(examiner_workgroup %in% c(179, 176)) %>%
+  distinct(examiner_id, examiner_workgroup) %>%
+  left_join(examiner_data, by='examiner_id')
+```
+
+## Create a network
+
+```{r}
+
+edge_subset <- edges %>% 
+  filter(ego_examiner_id %in% examiner_subset$examiner_id &
+           alter_examiner_id %in% examiner_subset$examiner_id) %>%
+  drop_na() %>% 
+  select(to = ego_examiner_id, from = alter_examiner_id)
+node_subset <- edge_subset %>% 
+  pivot_longer(cols=c('from','to')) %>% 
+  distinct(examiner_id = value) %>%
+  left_join(examiner_data, by='examiner_id') %>%
+  distinct(examiner_id, examiner_gender, examiner_race, examiner_tenure) %>%
+  rename(name = examiner_id) %>%
+  mutate(name = as.character(name))
+network <- graph_from_data_frame(edge_subset, directed = TRUE) %>%
+  as_tbl_graph() %>%
+  left_join(node_subset, by='name')
+
+
+network <- network %>%
+  mutate(degree = centrality_degree(),
+         betweenness = centrality_betweenness()) %>%
+  mutate(avg = (degree + betweenness)/2) %>%
+  mutate(label = paste0(name, '\n',
+                        'Degree: ',round(degree,2), '\n',
+                        'Betweenness: ',round(betweenness,2), '\n',
+                        'Avg: ',round(avg,2)))
+
+set.seed(1)
+net_gender <- network %>%
+  ggraph(layout="mds") +
+  geom_edge_link(edge_colour = "#0000FF", alpha=0.1) +
+  geom_node_point(aes(color=examiner_gender, size=avg)) +
+  theme_void()
+set.seed(1)
+net_race <- network %>%
+  ggraph(layout="mds") +
+  geom_edge_link(edge_colour = "#0000FF", alpha=0.1) +
+  geom_node_point(aes(color=examiner_race, size=avg)) +
+  theme_void()
+
+```
+
+
+```{r}
+
+net_gender
+net_race
+```
+
+
+Calculate centralities
+```{r}
+# betweenness
+bc_w179 <- sort(betweenness(g_w179), decreasing = TRUE)
+bc_w176 <- sort(betweenness(g_w176), decreasing = TRUE)
+# degree
+dg_w179 <- sort(degree(g_w179), decreasing = TRUE)
+dg_w176 <- sort(degree(g_w176), decreasing = TRUE)
+# closeness
+cc_w179 <- sort(closeness(g_w179), decreasing = TRUE)
+cc_w176 <- sort(closeness(g_w176), decreasing = TRUE)
+print("top 5 of betwenness centrality for work group 179")
+print(head(bc_w179,5))
+print("top 5 of betwenness centrality for work group 176")
+print(head(bc_w176,5))
+print("top 5 of degree centrality for work group 179")
+print(head(dg_w179,5))
+print("top 5 of degree centrality for work group 176")
+print(head(dg_w176,5))
+print("top 5 of closeness centrality for work group 179")
+print(head(cc_w179,15))
+print("top 5 of closeness centrality for work group 176")
+print(head(cc_w176,15))
+```
+## My Choice of Measures:
+
+Patent examination is a complex task that involves coordinating and communicating with other examiners, applicants, and stakeholders. Examining patents is also a highly specialized field, and patent examiners often work in specific technology areas. Therefore, it is important to understand the centrality of patent examiners in their workgroups to identify potential bottlenecks or inefficiencies in the examination process.
+
+I picked degree centrality because it can be used to identify examiners who are highly connected to other examiners in their workgroup. These examiners are likely to be important in terms of sharing information and knowledge within the group, and they may also be influential in terms of decision-making or providing feedback to other examiners.
+
+Betweenness centrality can be used to identify examiners who act as intermediaries or connectors between different technology areas or subgroups within the workgroup. These examiners may play a critical role in facilitating communication and information flow between different parts of the group and ensuring that the examination process is efficient.
+
+Closeness centrality can be used to identify examiners who are well-positioned to receive and disseminate information within their workgroup. These examiners are likely to have a good understanding of what is happening within the group and may be able to provide valuable feedback to other examiners.
+
+By analyzing the centrality measures of examiners within workgroups, we can gain insights into how the examination process is working and identify potential areas for improvement. For example, if certain examiners have low centrality measures, it may indicate that they are not as well-connected or influential within the group, and they may benefit from more communication or training. On the other hand, if certain examiners have very high centrality measures, it may indicate that they are overloaded with work or that the examination process is too dependent on them, and efforts may be needed to redistribute workload or improve communication within the group.
+
+
+Taken together, these centrality measures can provide a more nuanced understanding of the dynamics and functioning of workgroups within the USPTO. By identifying examiners who are particularly influential or central within the group, we can better understand the social structure and flow of work within the group, and potentially even identify areas for improvement or intervention.
+
+
+
+
+
+
+## Characterize and discuss the relationship between centrality and other examiners’characteristics
+
+For Work Group 179, we can see that the top 5 nodes with the highest betweenness centrality are all males, with tenure days ranging from 6342 to 6391. This indicates that these individuals play a critical role in connecting different nodes in the network and facilitating communication and information flow between different subgroups within the work group. In terms of race, all five individuals are White, which suggests that individuals from this racial group may have a higher level of influence and power within the organization.
+
+
+For degree centrality, we see that the top 5 nodes are also dominated by males, with one female (node 93896) included. These individuals have the highest number of connections to other nodes within the network, which suggests that they may be important sources of information and knowledge for other members of the work group. Interestingly, the top 5 nodes with the highest degree centrality do not overlap with those with the highest betweenness centrality, which suggests that there may be different types of influential individuals within the network.
+
+For closeness centrality, we see that the top nodes are predominantly females, with one male (node 76532) included. These individuals have the shortest paths to other nodes within the network, which suggests that they may be well-positioned to receive and disseminate information quickly and efficiently. Interestingly, the top nodes with the highest closeness centrality do not overlap with those with the highest betweenness or degree centrality, which again suggests that there may be different types of influential individuals within the network.
+
+
+For Work Group 176, we see a slightly different pattern. The top nodes with the highest betweenness centrality are all males, with the highest value (72809) being much smaller than those for Work Group 179. This suggests that there may be less variation in the extent to which different individuals are able to facilitate communication and information flow within this work group. In terms of race, all top nodes are either Asian or White, with no Black or Hispanic individuals included.
+
+
+For degree centrality, we see that the top nodes are dominated by nodes from Work Group 179, which may reflect the fact that individuals in this work group have more connections to other nodes within the overall network. Interestingly, the top nodes with the highest degree centrality do not overlap with those with the highest betweenness centrality, which again suggests that there may be different types of influential individuals within the network.
+
+
+For closeness centrality, we see that the top nodes are all either males or females with NA values for gender. These individuals have the shortest paths to other nodes within the network, which suggests that they may be well-positioned to receive and disseminate information quickly and efficiently. However, the top nodes with the highest closeness centrality do not overlap with those with the highest betweenness or degree centrality, which suggests that there may be different types of influential individuals within the network.
+
+
+Overall, these findings suggest that there are complex relationships between different types of centrality measures and other examiners' characteristics such as gender, race, and tenure days. While some patterns emerge, there is also a degree of heterogeneity in terms of which individuals are most influential within each work group, suggesting that different types of centrality measures may capture different aspects of influence and power within the network.
+
+
+## A Deeper Dive on Demographics
+
+Gender:
+
+
+Looking at the gender breakdown of the two work groups, we can see that work group 179 has more female examiners (43,783) than male examiners (77,344), while work group 176 has more male examiners (53,561) than female examiners (28,075). Interestingly, the top 5 betweenness centrality scores for work group 179 are all male examiners, while the top 5 for work group 176 are a mix of male and female examiners. This could suggest that male examiners in work group 179 may have more influence or play a more important role in the overall communication and collaboration patterns within the group. 
+
+
+Race:
+
+
+The racial breakdown of the two work groups shows that work group 179 has a higher proportion of white examiners (98,845) than any other race, while work group 176 has a relatively even distribution of white (61,824) and Asian (23,022) examiners. Looking at the betweenness centrality scores, we see that the top 5 for work group 179 are all white examiners, while the top 5 for work group 176 are a mix of Asian and white examiners. This could suggest that white examiners in both work groups may have more influence or play a more important role in communication and collaboration patterns within their respective groups.
+
+
+Tenure:
+
+
+Examining the tenure distribution for the two work groups, we see that work group 179 has a lower mean tenure (5,712 days) than work group 176 (5,501 days). Interestingly, the top 5 degree centrality scores for work group 179 include examiners with both relatively high tenure (e.g. examiner 91824 with a degree centrality score of 239) and lower tenure (e.g. examiner 92569 with a degree centrality score of 197). In contrast, the top 5 degree centrality scores for work group 176 all belong to examiners with relatively low tenure (ranging from 13 to 23 days). This could suggest that in work group 179, examiners with both high and low tenure levels are equally important for communication and collaboration, while in work group 176, newer examiners may be more important for these patterns.
+
+
+
+
+
